@@ -1,0 +1,5 @@
+.venv*/
+*.onnx
+*.wav
+*.pkl
+__pycache__/
