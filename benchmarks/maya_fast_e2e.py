@@ -28,13 +28,13 @@ def stub_lm(path, dtype, attn):
     cfg.layer_types = []
     with torch.device("meta"):
         lm = AutoModelForCausalLM.from_config(cfg, dtype=torch.float32, attn_implementation="sdpa")
-    lm = lm.to_empty(device="cpu")
     for m in lm.modules():
         if hasattr(m, "inv_freq") and hasattr(m, "rope_type"):
             from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
             fn = m.rope_init_fn if getattr(m, "rope_init_fn", None) is not None else (
                 m.compute_default_rope_parameters if m.rope_type == "default" else ROPE_INIT_FUNCTIONS[m.rope_type])
-            inv, scale = fn(m.config, torch.device("cpu"))
+            with torch.device("cpu"):  # rotary tables are real tensors even inside the meta-device build
+                inv, scale = fn(m.config, torch.device("cpu"))
             m.inv_freq = inv
             if hasattr(m, "original_inv_freq"):
                 m.original_inv_freq = inv
@@ -49,6 +49,8 @@ def load_ort_layers(onnx_dir, suffix, threads=8, spin=True):
     so = ort.SessionOptions()
     so.intra_op_num_threads = threads
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.enable_cpu_mem_arena = False  # return freed memory to the OS instead of keeping an arena
+    so.enable_mem_pattern = False
     if not spin:
         so.add_session_config_entry("session.intra_op.allow_spinning", "0")
     return [ort.InferenceSession(os.path.join(onnx_dir, f"layer_{i:02d}_{suffix}.onnx"), so,
@@ -87,32 +89,38 @@ class OrtBackbone:
 
 
 def load_weights(model, paths, L):
-    """Every checkpoint tensor except the 28 decoder layers goes into the model, strictly."""
+    """Assign every checkpoint tensor (except the 28 decoder layers) into a meta-device model, one at a time.
+    Nothing is randomly initialized and no weight is held twice, so the load peak is the model itself."""
+    import tts_lowram_load as LR
     src = os.path.abspath(str(paths["ckpt"]))
     _, files, _aliases = L._safetensors_files(src)
-    # Copy one tensor at a time straight into the model's parameters: no second full copy of the weights in RAM.
-    target = {**dict(model.named_parameters()), **dict(model.named_buffers())}
+    mods = dict(model.named_modules())
     seen, unexpected = set(), []
     for f in files:
         with safe_open(f, "pt") as fh:
             for k in fh.keys():
-                if k.startswith(LAYER_PREFIX) or k.startswith(L.ANCHOR_PREFIX):
+                if k.startswith(LAYER_PREFIX):
                     continue
                 name = k[len(L.MODEL_PREFIX):] if k.startswith(L.MODEL_PREFIX) else k
-                if name not in target:
+                parent_name, _, leaf = name.rpartition(".")
+                parent = mods.get(parent_name)
+                if parent is None or (leaf not in parent._parameters and leaf not in parent._buffers):
                     unexpected.append(name)
                     continue
-                with torch.no_grad():
-                    target[name].copy_(fh.get_tensor(k).to(target[name].dtype))
+                is_param = leaf in parent._parameters
+                t = fh.get_tensor(k).float()
+                LR._set(model, name, t, is_param=is_param)
                 seen.add(name)
+                del t
     if unexpected:
         raise RuntimeError(f"unexpected checkpoint keys: {unexpected[:5]}")
-    # lm_head is tied to embed_tokens (same Parameter), so it is loaded through the embedding key.
-    persistent = set(model.state_dict().keys())  # non-persistent buffers (e.g. rotary inv_freq) are not checkpointed
-    missing = [n for n in persistent if n not in seen and not n.startswith(LAYER_PREFIX)
-               and not n.startswith(L.ANCHOR_PREFIX) and n != "backbone.lm.lm_head.weight"]
-    if missing:
-        raise RuntimeError(f"missing model keys: {missing[:5]}")
+    # lm_head is tied to embed_tokens: re-tie after the embedding was replaced.
+    model.backbone.lm.tie_weights()
+    seen.add("backbone.lm.lm_head.weight")
+    left = [n for n, p in list(model.named_parameters()) + list(model.named_buffers()) if p.is_meta]
+    left = [n for n in left if not n.startswith(LAYER_PREFIX)]
+    if left:
+        raise RuntimeError(f"still on meta device (not in checkpoint): {left[:8]}")
     gc.collect()
 
 
@@ -158,19 +166,24 @@ def main():
     model_cfg["backbone"] = mcfg["model"]["backbone"]
     anchor_cfg = L._reconcile_anchor(model_cfg.get("speaker_anchor"),
                                      L.anchor_cfg_from_shapes(_shapes(paths, L)), require_anchor=True)
-    model = L.build_eval_model(model_cfg, anchor_cfg, 1.0, bool(model_cfg.get("depth_grouped", False))).eval()
+    with torch.device("meta"):  # shapes only; weights arrive from the checkpoint in load_weights
+        model = L.build_eval_model(model_cfg, anchor_cfg, 1.0, bool(model_cfg.get("depth_grouped", False))).eval()
+    print("RSS after_build mb=%.0f" % (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20), flush=True)
     load_weights(model, paths, L)
+    print("RSS after_weights mb=%.0f" % (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20), flush=True)
     model.depth.float()
 
     rcfg = AutoConfig.from_pretrained(str(paths["backbone_dir"]))
     rcfg._attn_implementation = "sdpa"
     rot = Qwen3RotaryEmbedding(config=rcfg).eval()
     sessions = load_ort_layers(a.onnx_dir, a.suffix, a.ort_threads, not a.no_spin)
+    print("RSS after_ort mb=%.0f" % (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20), flush=True)
     backbone = OrtBackbone(sessions, model.backbone.lm.model.norm, rot, rcfg)
     model.backbone.forward = backbone
 
     packer = PackerV2(model.backbone.tokenizer, model.backbone.token_ids, max_tokens=8192)
     mimi = MimiModel.from_pretrained(str(paths["mimi_dir"])).eval()
+    print("RSS after_mimi mb=%.0f" % (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20), flush=True)
     prior = S.load_prior(str(cfg_dir / "text_frames_prior.json"))
     registry = VoiceRegistry()
     load_named_voices(registry, paths["voices_json"])

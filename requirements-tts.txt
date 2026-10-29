@@ -1,0 +1,12 @@
+# Maya2 CPU TTS (Apple M-series). Install into .venv-tts only: .venv-tts/bin/pip install -r requirements-tts.txt
+torch==2.8.0
+torchaudio==2.8.0
+transformers==5.6.2
+speechbrain==1.1.2
+tokenizers>=0.22,<0.23
+scipy>=1.13
+safetensors>=0.6
+pyyaml>=6.0
+huggingface_hub>=1.0
+# upstream main head at spike time (2026-10-27)
+maya3 @ git+https://github.com/MayaResearch/maya2-native@c6b376868e268551d065c4206193e96257bef4a1
